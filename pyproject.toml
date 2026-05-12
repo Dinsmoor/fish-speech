@@ -14,8 +14,8 @@ classifiers = [
 ]
 dependencies = [
     "numpy",
-    "torch==2.8.0",
-    "torchaudio==2.8.0",
+    "torch==2.10.0",
+    "torchaudio==2.10.0",
     "transformers<=4.57.3",
     "datasets==2.18.0",
     "lightning>=2.1.0",
@@ -51,23 +51,23 @@ dependencies = [
 
 [project.optional-dependencies]
 stable = [
-    "torch==2.8.0",
+    "torch==2.10.0",
     "torchaudio",
 ]
 cpu = [
-  "torch==2.8.0",
+  "torch==2.10.0",
   "torchaudio",
 ]
 cu126 = [
-  "torch==2.8.0",
+  "torch==2.10.0",
   "torchaudio",
 ]
 cu128 = [
-  "torch==2.8.0",
+  "torch==2.10.0",
   "torchaudio",
 ]
 cu129 = [
-  "torch==2.8.0",
+  "torch==2.10.0",
   "torchaudio",
 ]
 
