@@ -1124,6 +1124,28 @@ def launch_batched_queue(
             )
         else:
             decode_step = decode_one_token_ar_batched
+
+        # Self-warm the batched path here (triggers torch.compile of decode_step)
+        # so the first real request is fast. The engine only routes referenced
+        # multi-sentence requests here, so its generic warmup never hits this path.
+        # The compiled decode step's shape is reference-independent, so a no-reference
+        # dummy of `batch_size` short sentences is enough to compile it.
+        try:
+            logger.info("Warming up batched path...")
+            dummy = " ".join(f"This is warm up sentence number {i}." for i in range(batch_size))
+            list(
+                generate_long_batched(
+                    model=model, decode_step=decode_step, batch_size=batch_size,
+                    device=device, text=dummy, max_new_tokens=64,
+                    top_p=0.7, top_k=30, temperature=0.7,
+                )
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info("Batched path warmed up.")
+        except Exception:
+            logger.error(traceback.format_exc())
+
         init_event.set()
 
         while True:

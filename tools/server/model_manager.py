@@ -116,22 +116,6 @@ class ModelManager:
             format="wav",
         )
         list(inference(request, tts_inference_engine))
-
-        # Warm up (and trigger torch.compile for) the batched path with a
-        # multi-sentence, non-streaming request so the first real request is fast.
-        if self.batched_queue is not None:
-            batched_request = ServeTTSRequest(
-                text="Hello world. This is a warm up. It compiles the batched path. "
-                "Now it is ready.",
-                references=[],
-                reference_id=None,
-                max_new_tokens=1024,
-                chunk_length=200,
-                top_p=0.7,
-                repetition_penalty=1.2,
-                temperature=0.7,
-                format="wav",
-                streaming=False,
-            )
-            list(inference(batched_request, tts_inference_engine))
+        # The batched worker self-warms (and compiles) at startup in
+        # launch_batched_queue, so no separate batched warmup is needed here.
         logger.info("Models warmed up.")
