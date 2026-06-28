@@ -409,8 +409,17 @@ def sample_batched(logits, temperature, top_p, top_k: int):
 
 
 def decode_one_token_ar_batched(
-    model, x, input_pos, temperature, top_p, top_k: int, valid_mask,
-    sb: int, se: int, im_end: int, nc: int,
+    model,
+    x,
+    input_pos,
+    temperature,
+    top_p,
+    top_k: int,
+    valid_mask,
+    sb: int,
+    se: int,
+    im_end: int,
+    nc: int,
 ):
     """One lockstep batched decode step. x: (B, codebook_dim, S) -> (B, codebook_dim).
 
@@ -422,8 +431,8 @@ def decode_one_token_ar_batched(
     res = model.forward_generate(
         x, input_pos, key_padding_mask=valid_mask.logical_not()
     )
-    logits = res.logits[:, -1]                       # (B, V)
-    hidden = res.hidden_states                        # (B, 1, fast_dim)
+    logits = res.logits[:, -1]  # (B, V)
+    hidden = res.hidden_states  # (B, 1, fast_dim)
     cand = torch.cat([logits[:, sb : se + 1], logits[:, im_end : im_end + 1]], dim=1)
     n_sem = se + 1 - sb
     idx = sample_batched(cand, temperature, top_p, top_k)  # (B,1) index into cand
@@ -439,13 +448,23 @@ def decode_one_token_ar_batched(
         fa = sample_batched(flogits[:, -1], temperature, top_p, top_k)
         h = model.fast_embeddings(fa)
         codebooks.append(fa)
-    return torch.cat(codebooks, dim=1)                # (B, codebook_dim)
+    return torch.cat(codebooks, dim=1)  # (B, codebook_dim)
 
 
 @torch.no_grad()
 def generate_batched(
-    *, model, prompts, decode_step, im_end, sb, se, nc,
-    temperature, top_p, top_k, max_new_tokens,
+    *,
+    model,
+    prompts,
+    decode_step,
+    im_end,
+    sb,
+    se,
+    nc,
+    temperature,
+    top_p,
+    top_k,
+    max_new_tokens,
 ):
     """prompts: list of (codebook_dim, T_i) tensors (left-padded to a common length
     internally). Returns list of (nc, L_i) code tensors, one per prompt, trimmed at
@@ -536,9 +555,19 @@ def _build_batched_system_parts(prompt_text, prompt_tokens):
 
 
 def generate_long_batched(
-    *, model, decode_step, batch_size, device, text,
-    max_new_tokens=0, top_p=0.8, top_k=30, temperature=0.8,
-    prompt_text=None, prompt_tokens=None, **_ignored,
+    *,
+    model,
+    decode_step,
+    batch_size,
+    device,
+    text,
+    max_new_tokens=0,
+    top_p=0.8,
+    top_k=30,
+    temperature=0.8,
+    prompt_text=None,
+    prompt_tokens=None,
+    **_ignored,
 ):
     """Sentence-chunk an utterance and synthesize chunks in parallel batches.
 
@@ -561,16 +590,32 @@ def generate_long_batched(
     def build_prompt(chunk_text):
         conv = Conversation()
         conv.append(
-            Message(role="system", parts=list(system_parts), cal_loss=False,
-                    add_im_start=True, add_im_end=True)
+            Message(
+                role="system",
+                parts=list(system_parts),
+                cal_loss=False,
+                add_im_start=True,
+                add_im_end=True,
+            )
         )
         conv.append(
-            Message(role="user", parts=[TextPart(text=chunk_text, cal_loss=False)],
-                    cal_loss=False, add_im_start=True, add_im_end=True)
+            Message(
+                role="user",
+                parts=[TextPart(text=chunk_text, cal_loss=False)],
+                cal_loss=False,
+                add_im_start=True,
+                add_im_end=True,
+            )
         )
         conv.append(
-            Message(role="assistant", parts=[], cal_loss=False, modality="voice",
-                    add_im_start=True, add_im_end=False)
+            Message(
+                role="assistant",
+                parts=[],
+                cal_loss=False,
+                modality="voice",
+                add_im_start=True,
+                add_im_end=False,
+            )
         )
         encoded, _, _ = conv.encode_for_inference(tokenizer, num_codebooks=nc)
         return encoded.to(device)
@@ -585,9 +630,16 @@ def generate_long_batched(
         padded = group + ["."] * (batch_size - n_real)
         prompts = [build_prompt(s) for s in padded]
         results = generate_batched(
-            model=model, prompts=prompts, decode_step=decode_step,
-            im_end=im_end, sb=sb, se=se, nc=nc,
-            temperature=temperature, top_p=top_p, top_k=top_k,
+            model=model,
+            prompts=prompts,
+            decode_step=decode_step,
+            im_end=im_end,
+            sb=sb,
+            se=se,
+            nc=nc,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
             max_new_tokens=max_new_tokens or 1024,
         )
         for i in range(n_real):
