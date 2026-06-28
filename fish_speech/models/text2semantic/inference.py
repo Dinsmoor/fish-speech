@@ -1132,12 +1132,20 @@ def launch_batched_queue(
         # dummy of `batch_size` short sentences is enough to compile it.
         try:
             logger.info("Warming up batched path...")
-            dummy = " ".join(f"This is warm up sentence number {i}." for i in range(batch_size))
+            dummy = " ".join(
+                f"This is warm up sentence number {i}." for i in range(batch_size)
+            )
             list(
                 generate_long_batched(
-                    model=model, decode_step=decode_step, batch_size=batch_size,
-                    device=device, text=dummy, max_new_tokens=64,
-                    top_p=0.7, top_k=30, temperature=0.7,
+                    model=model,
+                    decode_step=decode_step,
+                    batch_size=batch_size,
+                    device=device,
+                    text=dummy,
+                    max_new_tokens=64,
+                    top_p=0.7,
+                    top_k=30,
+                    temperature=0.7,
                 )
             )
             if torch.cuda.is_available():
