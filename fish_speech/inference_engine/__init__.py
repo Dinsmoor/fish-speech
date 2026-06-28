@@ -14,6 +14,7 @@ from fish_speech.models.text2semantic.inference import (
     GenerateRequest,
     GenerateResponse,
     WrappedGenerateResponse,
+    split_sentences,
 )
 from fish_speech.utils import autocast_exclude_mps, set_seed
 from fish_speech.utils.schema import ServeTTSRequest
@@ -27,11 +28,15 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         decoder_model: DAC,
         precision: torch.dtype,
         compile: bool,
+        batched_queue: queue.Queue | None = None,
     ) -> None:
 
         super().__init__()
 
         self.llama_queue = llama_queue
+        # Optional parallel sentence-chunk worker (faster-than-realtime for
+        # multi-sentence non-streaming requests). None -> always use llama_queue.
+        self.batched_queue = batched_queue
         self.decoder_model = decoder_model
         self.precision = precision
         self.compile = compile
@@ -166,8 +171,23 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         # Create a queue to get the response
         response_queue = queue.Queue()
 
-        # Send the request to the LLAMA model
-        self.llama_queue.put(
+        # Route to the parallel sentence-chunk worker for multi-sentence,
+        # non-streaming requests WITH a reference voice (faster than realtime).
+        # A reference is required because independent chunks would otherwise each
+        # sample a different default voice; with a reference, timbre is locked.
+        # Everything else (single sentence, streaming, default voice, or no batched
+        # worker) uses the sequential worker, which preserves cross-chunk prosody.
+        has_reference = bool(req.reference_id) or bool(req.references)
+        target_queue = self.llama_queue
+        if (
+            self.batched_queue is not None
+            and not req.streaming
+            and has_reference
+            and len(split_sentences(req.text)) >= 2
+        ):
+            target_queue = self.batched_queue
+
+        target_queue.put(
             GenerateRequest(
                 request=request,
                 response_queue=response_queue,

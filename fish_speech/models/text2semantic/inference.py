@@ -259,18 +259,27 @@ def generate(
     T = prompt.size(1)
     prompt = prompt[None].repeat(num_samples, 1, 1)
 
-    if T >= model.config.max_seq_len:
+    # Bound generation by the actual KV-cache width (model.max_seq_len, set by
+    # setup_caches) rather than the model's config max_seq_len, which may be far
+    # larger than the allocated cache.
+    seq_limit = (
+        model.max_seq_len
+        if getattr(model, "max_seq_len", -1) and model.max_seq_len > 0
+        else model.config.max_seq_len
+    )
+
+    if T >= seq_limit:
         raise ValueError(
-            f"Input sequence length {T} exceeds max_seq_len {model.config.max_seq_len}"
+            f"Input sequence length {T} exceeds cache max_seq_len {seq_limit}"
         )
 
     if max_new_tokens:
-        if T + max_new_tokens > model.config.max_seq_len:
-            max_new_tokens = model.config.max_seq_len - T
+        if T + max_new_tokens > seq_limit:
+            max_new_tokens = seq_limit - T
 
         T_new = T + max_new_tokens
     else:
-        T_new = model.config.max_seq_len
+        T_new = seq_limit
         max_new_tokens = T_new - T
 
     device = prompt.device
@@ -357,6 +366,234 @@ def generate(
     del first_token, x, prompt, empty, input_pos
 
     return seq
+
+
+# ===========================================================================
+# Batched (parallel sentence-chunk) generation
+#
+# Splits one utterance into sentence chunks and generates them in a single
+# forward batch (lockstep decode over the batch dim). On the GB10 this turns the
+# ~2.0 single-stream RTF into ~0.65 (faster than realtime) because the GPU is
+# heavily underutilized at batch 1. Critically it requires a SMALL KV cache: with
+# an attention mask, each step attends over the full cache width, so a large
+# max_seq_len dominates the cost and kills batch scaling.
+# ===========================================================================
+
+_SENTENCE_RE = re.compile(r"[^.!?。！？\n]+[.!?。！？]?", re.UNICODE)
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split text into sentence-ish chunks for parallel synthesis."""
+    parts = [s.strip() for s in _SENTENCE_RE.findall(text)]
+    return [p for p in parts if p]
+
+
+def logits_to_probs_batched(logits, temperature, top_p, top_k: int):
+    # logits: (B, V)
+    sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+    cum = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+    idx = torch.arange(sorted_logits.shape[-1], device=logits.device)
+    remove = (cum > top_p) | (idx >= top_k)[None, :]
+    remove[:, 0] = False
+    remove = remove.scatter(-1, sorted_idx, remove)
+    logits = torch.where(remove, float("-inf"), logits) / torch.clip(
+        temperature, min=1e-5
+    )
+    return torch.softmax(logits, dim=-1)
+
+
+def sample_batched(logits, temperature, top_p, top_k: int):
+    probs = logits_to_probs_batched(logits, temperature, top_p, top_k)
+    q = -torch.log(torch.rand_like(probs))
+    return torch.argmax(probs / q, dim=-1, keepdim=True).to(torch.int)  # (B,1)
+
+
+def decode_one_token_ar_batched(
+    model, x, input_pos, temperature, top_p, top_k: int, valid_mask,
+    sb: int, se: int, im_end: int, nc: int,
+):
+    """One lockstep batched decode step. x: (B, codebook_dim, S) -> (B, codebook_dim).
+
+    The main token can only be a semantic token or im_end, so we sample over just
+    that candidate set (~4097) instead of the full 155776 vocab — equivalent to the
+    -inf bias but far cheaper and avoids an inductor cumsum codegen bug. sb/se/im_end/nc
+    are passed as ints (constants) so this compiles fullgraph.
+    """
+    res = model.forward_generate(
+        x, input_pos, key_padding_mask=valid_mask.logical_not()
+    )
+    logits = res.logits[:, -1]                       # (B, V)
+    hidden = res.hidden_states                        # (B, 1, fast_dim)
+    cand = torch.cat([logits[:, sb : se + 1], logits[:, im_end : im_end + 1]], dim=1)
+    n_sem = se + 1 - sb
+    idx = sample_batched(cand, temperature, top_p, top_k)  # (B,1) index into cand
+    main = torch.where(idx >= n_sem, torch.full_like(idx, im_end), idx + sb)
+
+    codebooks = [main]
+    model.forward_generate_fast(hidden, torch.tensor([0], device=x.device))
+    a = torch.clamp(main - sb, 0, model.config.codebook_size - 1)
+    h = model.fast_embeddings(a)
+    codebooks.append(a)
+    for cb in range(1, nc):
+        flogits = model.forward_generate_fast(h, torch.tensor([cb], device=x.device))
+        fa = sample_batched(flogits[:, -1], temperature, top_p, top_k)
+        h = model.fast_embeddings(fa)
+        codebooks.append(fa)
+    return torch.cat(codebooks, dim=1)                # (B, codebook_dim)
+
+
+@torch.no_grad()
+def generate_batched(
+    *, model, prompts, decode_step, im_end, sb, se, nc,
+    temperature, top_p, top_k, max_new_tokens,
+):
+    """prompts: list of (codebook_dim, T_i) tensors (left-padded to a common length
+    internally). Returns list of (nc, L_i) code tensors, one per prompt, trimmed at
+    each row's im_end."""
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    B = len(prompts)
+    cb_dim = nc + 1
+    T_max = max(p.size(1) for p in prompts)
+    max_seq = model.max_seq_len
+
+    if T_max >= max_seq:
+        raise ValueError(
+            f"Batched prompt length {T_max} exceeds cache width {max_seq}; "
+            f"use a longer cache or shorter reference/chunks."
+        )
+
+    batch = torch.zeros((B, cb_dim, T_max), dtype=torch.int, device=device)
+    valid = torch.zeros((B, max_seq), dtype=torch.bool, device=device)
+    for i, p in enumerate(prompts):
+        Ti = p.size(1)
+        pad = T_max - Ti
+        batch[i, :, pad:] = p.to(device)
+        valid[i, pad:T_max] = True
+
+    temp_t = torch.tensor(temperature, device=device, dtype=dtype)
+    topp_t = torch.tensor(top_p, device=device, dtype=dtype)
+
+    # prefill (eager, variable length)
+    input_pos = torch.arange(0, T_max, device=device)
+    first = decode_one_token_ar_batched(
+        model, batch, input_pos, temp_t, topp_t, top_k, valid, sb, se, im_end, nc
+    )
+
+    max_steps = min(max_new_tokens, max_seq - T_max)
+    all_tokens = torch.zeros((B, cb_dim, max_steps), dtype=torch.int, device=device)
+    all_tokens[:, :, 0] = first
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+    end_step = torch.full((B,), max_steps, dtype=torch.long, device=device)
+
+    cur = first.unsqueeze(-1)
+    pos = T_max
+    pos_t = torch.tensor([pos], device=device)
+    nsteps = 1
+    for step in range(1, max_steps):
+        valid[:, pos] = True
+        pos_t.fill_(pos)
+        nxt = decode_step(
+            model, cur, pos_t, temp_t, topp_t, top_k, valid, sb, se, im_end, nc
+        )
+        all_tokens[:, :, step] = nxt
+        newly = (nxt[:, 0] == im_end) & (~finished)
+        end_step = torch.where(newly, torch.tensor(step, device=device), end_step)
+        finished = finished | newly
+        cur = nxt.unsqueeze(-1)
+        pos += 1
+        nsteps = step + 1
+        if bool(finished.all()) or pos >= max_seq - 1:
+            break
+
+    end_step = end_step.clamp(max=nsteps).tolist()
+    results = []
+    for i in range(B):
+        codes = all_tokens[i, 1:, : end_step[i]].clone()  # (nc, L)
+        results.append(torch.clamp(codes, min=0))
+    return results
+
+
+def _build_batched_system_parts(prompt_text, prompt_tokens):
+    """Mirror generate_long's system prompt (reference text + VQ codes, or generic)."""
+    use_prompt = bool(prompt_text) and bool(prompt_tokens)
+    if use_prompt:
+        tagged = []
+        for i, t in enumerate(prompt_text):
+            tagged.append(
+                t if re.search(r"<\|speaker:\d+\|>", t) else f"<|speaker:{i}|>{t}"
+            )
+        return [
+            TextPart(
+                text="convert the provided text to speech reference to the following:\n\nText:\n",
+                cal_loss=False,
+            ),
+            TextPart(text="\n".join(tagged), cal_loss=False),
+            TextPart(text="\n\nSpeech:\n", cal_loss=False),
+            VQPart(codes=torch.cat([c for c in prompt_tokens], dim=1), cal_loss=False),
+        ]
+    return [TextPart(text="convert the provided text to speech", cal_loss=False)]
+
+
+def generate_long_batched(
+    *, model, decode_step, batch_size, device, text,
+    max_new_tokens=0, top_p=0.8, top_k=30, temperature=0.8,
+    prompt_text=None, prompt_tokens=None, **_ignored,
+):
+    """Sentence-chunk an utterance and synthesize chunks in parallel batches.
+
+    Yields GenerateResponse(action="sample", codes=...) per chunk in order, then a
+    final GenerateResponse(action="next") — same protocol as generate_long."""
+    if isinstance(prompt_text, str):
+        prompt_text = [prompt_text]
+    if prompt_tokens is not None and not isinstance(prompt_tokens, list):
+        prompt_tokens = [prompt_tokens]
+    if prompt_tokens:
+        prompt_tokens = [t.cpu() for t in prompt_tokens]
+
+    tokenizer = model.tokenizer
+    nc = model.config.num_codebooks
+    sb = model.config.semantic_begin_id
+    se = model.config.semantic_end_id
+    im_end = tokenizer.get_token_id(IM_END_TOKEN)
+    system_parts = _build_batched_system_parts(prompt_text, prompt_tokens)
+
+    def build_prompt(chunk_text):
+        conv = Conversation()
+        conv.append(
+            Message(role="system", parts=list(system_parts), cal_loss=False,
+                    add_im_start=True, add_im_end=True)
+        )
+        conv.append(
+            Message(role="user", parts=[TextPart(text=chunk_text, cal_loss=False)],
+                    cal_loss=False, add_im_start=True, add_im_end=True)
+        )
+        conv.append(
+            Message(role="assistant", parts=[], cal_loss=False, modality="voice",
+                    add_im_start=True, add_im_end=False)
+        )
+        encoded, _, _ = conv.encode_for_inference(tokenizer, num_codebooks=nc)
+        return encoded.to(device)
+
+    sentences = split_sentences(text) or [text]
+    logger.info(f"[batched] {len(sentences)} sentence chunks, batch_size={batch_size}")
+
+    for g in range(0, len(sentences), batch_size):
+        group = sentences[g : g + batch_size]
+        n_real = len(group)
+        # pad to a fixed batch size so torch.compile sees one shape
+        padded = group + ["."] * (batch_size - n_real)
+        prompts = [build_prompt(s) for s in padded]
+        results = generate_batched(
+            model=model, prompts=prompts, decode_step=decode_step,
+            im_end=im_end, sb=sb, se=se, nc=nc,
+            temperature=temperature, top_p=top_p, top_k=top_k,
+            max_new_tokens=max_new_tokens or 1024,
+        )
+        for i in range(n_real):
+            yield GenerateResponse(action="sample", codes=results[i], text=group[i])
+
+    yield GenerateResponse(action="next")
 
 
 def init_model(checkpoint_path, device, precision, compile=False):
@@ -790,6 +1027,76 @@ def launch_thread_safe_queue(
                 logger.error(traceback.format_exc())
                 response_queue.put(WrappedGenerateResponse(status="error", response=e))
                 # Clear cache on error
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    threading.Thread(target=worker, daemon=True).start()
+    init_event.wait()
+
+    return input_queue
+
+
+def launch_batched_queue(
+    checkpoint_path,
+    device,
+    precision,
+    compile: bool = False,
+    batch_size: int = 4,
+    cache_len: int = 2048,
+):
+    """Worker for the parallel sentence-chunk (batched) path.
+
+    Uses its own model instance with a SMALL KV cache (cache_len), which is what makes
+    batched attention cheap and the whole utterance faster-than-realtime. Separate from
+    the sequential worker so the existing path (long text / streaming, which accumulates
+    conversation and needs the large cache) is unaffected.
+    """
+    input_queue = queue.Queue()
+    init_event = threading.Event()
+
+    def worker():
+        model, _ = init_model(checkpoint_path, device, precision, compile=False)
+        with torch.device(device):
+            model.setup_caches(
+                max_batch_size=batch_size,
+                max_seq_len=cache_len,
+                dtype=next(model.parameters()).dtype,
+            )
+        if compile:
+            logger.info("Compiling batched decode step...")
+            decode_step = torch.compile(
+                decode_one_token_ar_batched,
+                backend="inductor",
+                mode="default",
+                fullgraph=True,
+            )
+        else:
+            decode_step = decode_one_token_ar_batched
+        init_event.set()
+
+        while True:
+            item: GenerateRequest | None = input_queue.get()
+            if item is None:
+                break
+
+            kwargs = item.request
+            response_queue = item.response_queue
+
+            try:
+                for chunk in generate_long_batched(
+                    model=model,
+                    decode_step=decode_step,
+                    batch_size=batch_size,
+                    **kwargs,
+                ):
+                    response_queue.put(
+                        WrappedGenerateResponse(status="success", response=chunk)
+                    )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                response_queue.put(WrappedGenerateResponse(status="error", response=e))
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 

@@ -206,8 +206,12 @@ class KVCache(nn.Module):
         # input_pos: [S], k_val: [B, H, S, D]
         assert input_pos.shape[0] == k_val.shape[2]
 
-        k_out = self.k_cache
-        v_out = self.v_cache
+        # Allow a smaller active batch than the allocated cache so one cache (sized
+        # B_max) can serve both batch-1 (sequential) and batch-N (batched) forwards
+        # without reallocation. Only the active rows are written/returned.
+        b = k_val.shape[0]
+        k_out = self.k_cache[:b]
+        v_out = self.v_cache[:b]
         k_out[:, :, input_pos] = k_val
         v_out[:, :, input_pos] = v_val
 
@@ -394,6 +398,7 @@ class BaseTransformer(nn.Module):
         audio_masks: Optional[Tensor] = None,
         audio_parts: Optional[Tensor] = None,
         return_all: bool = False,
+        key_padding_mask: Optional[Tensor] = None,
     ) -> BaseTransformerForwardResult:
 
         # Embedding logic replicated from embed() for compilation compatibility
@@ -439,6 +444,11 @@ class BaseTransformer(nn.Module):
             max_seq_len = self.max_seq_len
 
         mask = self.causal_mask[None, None, input_pos, :max_seq_len]  # (B, N, Q, K)
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, max_seq_len), True == padding (to be ignored).
+            # Broadcast over heads/query dim and combine with the causal mask so
+            # left-padded prompt positions are never attended to as keys.
+            mask = mask & key_padding_mask[:, None, None, :max_seq_len].logical_not()
         freqs_cis = self.freqs_cis[input_pos]
 
         for layer in self.layers:
@@ -822,8 +832,11 @@ class DualARTransformer(BaseTransformer):
         input_pos: Optional[Tensor] = None,
         audio_masks: Optional[Tensor] = None,
         audio_parts: Optional[Tensor] = None,
+        key_padding_mask: Optional[Tensor] = None,
     ) -> TransformerForwardResult:
-        x = super().forward_generate(x, input_pos, audio_masks, audio_parts)
+        x = super().forward_generate(
+            x, input_pos, audio_masks, audio_parts, key_padding_mask=key_padding_mask
+        )
         x.hidden_states = self.fast_project_in(x.hidden_states)
         return x
 
