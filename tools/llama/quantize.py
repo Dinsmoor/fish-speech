@@ -487,6 +487,17 @@ def quantize(checkpoint_path: Path, mode: str, groupsize: int, timestamp: str) -
             f"Invalid quantization mode {mode} needs to be one of [int8, int4, int4-gpptq]"
         )
 
+    # Remove the original bf16 weight files copied from the source checkpoint.
+    # The loader (llama.from_pretrained) prefers safetensors over model.pth, so
+    # leaving them here would silently load the unquantized weights into the
+    # quantized modules and ignore model.pth entirely.
+    for stale in list(dst_name.glob("model-*.safetensors")) + [
+        dst_name / "model.safetensors.index.json",
+        dst_name / "model.safetensors",
+    ]:
+        if stale.exists():
+            stale.unlink()
+
     print(f"Writing quantized weights to {quantize_path}")
     quantize_path.unlink(missing_ok=True)  # remove existing file if one already there
     torch.save(quantized_state_dict, quantize_path)
