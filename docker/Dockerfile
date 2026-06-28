@@ -150,6 +150,12 @@ ENV BACKEND=${BACKEND} \
     # no linux-aarch64 wheel on PyPI, only on the pytorch CUDA index).
     UV_NO_SYNC=1
 
+# CUDA 13 (cu130) wheels ship their CUDA libs under nvidia/cu13/lib. Put it on
+# the loader path so nvrtc (invoked by torch.compile / --compile) can find
+# libnvrtc-builtins.so.13. Prepended; harmless for non-cu130 builds where the
+# directory simply does not exist.
+ENV LD_LIBRARY_PATH=/app/.venv/lib/python${PY_VER}/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH}
+
 # System dependencies for audio processing
 ARG DEPENDENCIES=" \
     libsox-dev \
@@ -223,6 +229,17 @@ COPY --chown=${USER_UID}:${USER_GID} . .
 
 # Install the local package after copying source code
 RUN uv sync --extra ${UV_EXTRA} --frozen
+
+# The cu130 torch wheels do not declare an nvrtc dependency, but torch.compile
+# needs libnvrtc at runtime. Install the CUDA 13 nvrtc package for cu130 builds.
+# CUDA 13 uses the unsuffixed name `nvidia-cuda-nvrtc` (the `-cu13` name is a
+# stub that errors); this resolves to the cu13 build from the cu130 index.
+RUN if [ "${UV_EXTRA}" = "cu130" ]; then \
+        uv pip install --index-strategy unsafe-best-match \
+            --index-url https://download.pytorch.org/whl/cu130 \
+            --extra-index-url https://pypi.org/simple \
+            nvidia-cuda-nvrtc ; \
+    fi
 
 # Create common entrypoint script
 RUN printf '%s\n' \

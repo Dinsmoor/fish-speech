@@ -79,6 +79,16 @@ cu129 = [
   "torchaudio",
   "torchcodec",
 ]
+# CUDA 13 build for Blackwell (sm_120/sm_121, e.g. NVIDIA GB10 / DGX Spark).
+# Same torch version as the other extras (2.10.0+cu130 is a local build of
+# 2.10.0), it just ships native Blackwell kernels instead of PTX-JIT fallback.
+# NOTE: the cu13 torch wheels do not pull nvrtc; the Dockerfile installs
+# nvidia-cuda-nvrtc-cu13 separately for the torch.compile (--compile) path.
+cu130 = [
+  "torch==2.10.0",
+  "torchaudio",
+  "torchcodec",
+]
 
 [tool.uv]
 override-dependencies = [
@@ -92,6 +102,7 @@ conflicts = [
     { extra = "cu126" },
     { extra = "cu128" },
     { extra = "cu129" },
+    { extra = "cu130" },
   ],
 ]
 
@@ -101,18 +112,21 @@ torch = [
   { index = "pytorch-cu126", extra = "cu126" },
   { index = "pytorch-cu128", extra = "cu128" },
   { index = "pytorch-cu129", extra = "cu129" },
+  { index = "pytorch-cu130", extra = "cu130" },
 ]
 torchaudio = [
   { index = "pytorch-cpu", extra = "cpu" },
   { index = "pytorch-cu126", extra = "cu126" },
   { index = "pytorch-cu128", extra = "cu128" },
   { index = "pytorch-cu129", extra = "cu129" },
+  { index = "pytorch-cu130", extra = "cu130" },
 ]
 torchcodec = [
   { index = "pytorch-cpu", extra = "cpu" },
   { index = "pytorch-cu126", extra = "cu126" },
   { index = "pytorch-cu128", extra = "cu128" },
   { index = "pytorch-cu129", extra = "cu129" },
+  { index = "pytorch-cu130", extra = "cu130" },
 ]
 
 [[tool.uv.index]]
@@ -133,6 +147,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [build-system]
