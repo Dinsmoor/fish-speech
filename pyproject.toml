@@ -16,6 +16,10 @@ dependencies = [
     "numpy",
     "torch==2.10.0",
     "torchaudio==2.10.0",
+    # torchaudio 2.9+ routes torchaudio.load() through torchcodec; required for
+    # reference-audio loading (voice cloning). Pinned to the release built
+    # against torch 2.10 (newer torchcodec ABI-mismatches torch 2.10).
+    "torchcodec==0.10.0",
     "transformers<=4.57.3",
     "datasets==2.18.0",
     "lightning>=2.1.0",
@@ -53,22 +57,27 @@ dependencies = [
 stable = [
     "torch==2.10.0",
     "torchaudio",
+    "torchcodec",
 ]
 cpu = [
   "torch==2.10.0",
   "torchaudio",
+  "torchcodec",
 ]
 cu126 = [
   "torch==2.10.0",
   "torchaudio",
+  "torchcodec",
 ]
 cu128 = [
   "torch==2.10.0",
   "torchaudio",
+  "torchcodec",
 ]
 cu129 = [
   "torch==2.10.0",
   "torchaudio",
+  "torchcodec",
 ]
 
 [tool.uv]
@@ -94,6 +103,12 @@ torch = [
   { index = "pytorch-cu129", extra = "cu129" },
 ]
 torchaudio = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu126", extra = "cu126" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu129", extra = "cu129" },
+]
+torchcodec = [
   { index = "pytorch-cpu", extra = "cpu" },
   { index = "pytorch-cu126", extra = "cu126" },
   { index = "pytorch-cu128", extra = "cu128" },
