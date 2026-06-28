@@ -142,7 +142,13 @@ ARG UV_EXTRA
 ENV BACKEND=${BACKEND} \
     DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    # The runtime env is fully installed at build time via `uv sync --extra
+    # ${UV_EXTRA}`. Without this, the entrypoint's `uv run` re-syncs against the
+    # *default* (no-extra) deps and re-resolves index-pinned packages from PyPI
+    # -- which breaks on platforms where PyPI lacks a wheel (e.g. torchcodec has
+    # no linux-aarch64 wheel on PyPI, only on the pytorch CUDA index).
+    UV_NO_SYNC=1
 
 # System dependencies for audio processing
 ARG DEPENDENCIES=" \
