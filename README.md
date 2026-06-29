@@ -104,6 +104,41 @@ More details of the model can be found in the [technical report](https://arxiv.o
 
 On Seed-TTS Eval, S2 achieves the lowest WER among all evaluated models including closed-source systems: Qwen3-TTS (0.77/1.24), MiniMax Speech-02 (0.99/1.90), Seed-TTS (1.12/2.25). On the Audio Turing Test, 0.515 surpasses Seed-TTS (0.417) by 24% and MiniMax-Speech (0.387) by 33%. On EmergentTTS-Eval, S2 achieves particularly strong results in paralinguistics (91.61% win rate), questions (84.41%), and syntactic complexity (83.39%).
 
+## Performance on NVIDIA DGX Spark / GB10 (fork additions)
+
+This fork adds **faster-than-realtime single-utterance TTS on the NVIDIA GB10** (DGX Spark — Grace-Blackwell, `sm_121`, 128 GB unified memory), natively, without vLLM.
+
+On the GB10 the S2-Pro decode loop is **latency/overhead-bound, not memory-bandwidth-bound** (it uses only ~6 of ~273 GB/s), so single-stream generation plateaus around **~2.0 RTF** regardless of CUDA version or quantization. The GPU is heavily underutilized at batch 1, so the win comes from **batching sentence chunks** to fill it, combined with a **small KV cache** (the stock `max_seq_len` of 32768 made every decode step attend over 32768 keys — the hidden ceiling).
+
+Real-time factor (RTF = wall-time ÷ audio seconds; **< 1.0 = faster than realtime**), S2-Pro, `--compile`, CUDA 13:
+
+| Path | Precision | RTF | Notes |
+|------|-----------|-----|-------|
+| Sequential (single utterance) | bf16 | 2.43 | stock single-stream |
+| Sequential (single utterance) | int8 | 1.96 | int8 helps at batch 1 (bandwidth-bound) |
+| **Batched ×4 (multi-sentence, compute)** | **bf16** | **0.65** | **faster than realtime** |
+| Batched ×4 (multi-sentence, end-to-end API) | bf16 | 0.86 | incl. HTTP + DAC decode + WAV encode |
+| Batched ×4 (multi-sentence) | int8 | 1.51 | int8 *regresses* the batched path |
+
+**Takeaways**
+
+- Multi-sentence requests are split into sentences and synthesized in **one forward batch**, then concatenated — **~0.65 RTF** single utterance.
+- **int8 only helps the sequential path** (bandwidth-bound at batch 1, ~1.96 vs 2.43, and ~5 GB vs ~9 GB). It **regresses the batched path** (1.51 vs 0.65) because batching is *compute*-bound — so the server runs **bf16 for batched, int8 for sequential**.
+- The API server **auto-routes**: multi-sentence + non-streaming + a reference voice → batched (fast); single-sentence / streaming / default-voice → sequential (preserves cross-chunk prosody and streaming).
+
+### Enabling
+
+Build the image with the CUDA 13 extra (`UV_EXTRA=cu130`) and start the API server with `--compile` (`COMPILE=1`). The batched path is on by default; tune it with environment variables:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `FISH_BATCHED` | `1` | Enable the parallel sentence-chunk path (`0` disables, frees a second model instance) |
+| `FISH_BATCHED_SIZE` | `4` | Chunks generated per batch |
+| `FISH_BATCHED_CACHE_LEN` | `2048` | KV-cache width for the batched path (must hold reference + a chunk's generation) |
+| `FISH_SEQ_CHECKPOINT` | _(unset)_ | Optional separate checkpoint for the sequential path (point at an int8 checkpoint to make single-sentence/streaming faster and smaller) |
+
+An int8 checkpoint can be produced with `python tools/llama/quantize.py --checkpoint-path checkpoints/s2-pro --mode int8`.
+
 ## Highlights
 
 <img src="./docs/assets/totalability.png" width=200%>

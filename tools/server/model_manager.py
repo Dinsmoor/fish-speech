@@ -13,10 +13,17 @@ from fish_speech.utils.schema import ServeTTSRequest
 from tools.server.inference import inference_wrapper as inference
 
 # Parallel sentence-chunk path (faster-than-realtime on GB10). Set
-# FISH_BATCHED=0 to disable (saves ~9GB for a second model instance).
+# FISH_BATCHED=0 to disable (saves a second model instance).
 BATCHED_ENABLED = os.environ.get("FISH_BATCHED", "1") != "0"
 BATCHED_SIZE = int(os.environ.get("FISH_BATCHED_SIZE", "4"))
 BATCHED_CACHE_LEN = int(os.environ.get("FISH_BATCHED_CACHE_LEN", "2048"))
+
+# Optional separate checkpoint for the SEQUENTIAL path (single sentence /
+# streaming). int8 helps there (it's bandwidth-bound at batch 1: ~1.96 vs 2.43
+# RTF, ~5GB vs ~9GB). The batched path stays on the main (bf16) checkpoint —
+# int8 REGRESSES it (1.51 vs 0.65) because batching is compute-bound, not
+# bandwidth-bound. Set FISH_SEQ_CHECKPOINT to an int8 checkpoint dir to enable.
+SEQ_CHECKPOINT = os.environ.get("FISH_SEQ_CHECKPOINT", "")
 
 
 class ModelManager:
@@ -70,8 +77,13 @@ class ModelManager:
     ) -> None:
 
         if mode == "tts":
+            seq_checkpoint = SEQ_CHECKPOINT or checkpoint_path
+            if SEQ_CHECKPOINT:
+                logger.info(
+                    f"Sequential path using separate checkpoint: {seq_checkpoint}"
+                )
             self.llama_queue = launch_thread_safe_queue(
-                checkpoint_path=checkpoint_path,
+                checkpoint_path=seq_checkpoint,
                 device=device,
                 precision=precision,
                 compile=compile,
